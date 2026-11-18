@@ -1,0 +1,975 @@
+---
+title: "NHANES Data Preperation and Analysis"
+author: "Christopher"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: true
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+knitr:
+  opts_chunk: 
+    fig.align: 'center'
+    fig.width: 6
+    fig.height: 4
+    message: FALSE
+    cache: false
+---
+
+#Data Preperation
+# Load packages
+```{r}
+#| warning: false
+
+library(writexl)
+library(haven)
+library(tidyverse)
+library(gtsummary)
+library(broom)
+library(survey)
+library(mice)
+library(mitools)
+library(gt)
+library(heiscore)
+```
+
+# Select Relevant variables needed from the NHANES data
+```{r}
+library(haven)
+library(dplyr)
+library(purrr)
+
+files <- list.files(path = "C:/Users/chris/OneDrive/Desktop/nhanes",
+                    pattern = "\\.xpt$",
+                    full.names = TRUE)
+
+
+# Read all files and tag each with its filename/cycle
+df_list <- lapply(files, function(f) {
+  df <- read_xpt(f)
+  df$source_file <- basename(f)  # optional: track where it came from
+  return(df)
+})
+
+
+
+# --- Option 2: Merge multiple components within each cycle, then bind cycles ---
+# Split files by cycle (adjust the pattern to match your naming convention)
+cycle1_files <- files[grepl("_E", files)]  # e.g., 2017-2018
+cycle2_files <- files[grepl("_F", files)]  # e.g., 2021-2023
+
+read_and_merge <- function(file_list) {
+  file_list <- file_list[order(!grepl("DEMO", file_list))]  # DEMO first
+  dfs <- lapply(file_list, read_xpt)
+  Reduce(function(a, b) full_join(a, b, by = "SEQN"), dfs)
+}
+
+# read_and_merge <- function(file_list) {
+#   dfs <- lapply(file_list, read_xpt)
+#   Reduce(function(a, b) full_join(a, b, by = "SEQN"), dfs)
+# }
+
+ cycle1 <- read_and_merge(cycle1_files) %>% mutate(cycle = "2007-2008")    
+ cycle2 <- read_and_merge(cycle2_files) %>% mutate(cycle = "2009-2010")
+
+nhanes_combined <- bind_rows(cycle1, cycle2) %>%
+  select(
+    SEQN, cycle, RIAGENDR, RIDAGEYR,
+    RIDRETH1, DMDEDUC2, INDFMPIR,
+    DMDEDUC3,
+    CBD740, CBD745,
+    BPXSY2, BPXSY3, BPXSY4,
+    BPXDI2, BPXDI3, BPXDI4,
+    BPQ020, BPQ050A,
+    ALQ120Q, ALQ120U, ALQ130,
+    SMQ020, SMQ040,
+    PAQ605, PAQ610, PAD615,
+    PAQ620, PAQ625, PAD630,
+    PAQ635, PAQ640, PAD645,
+    PAQ650, PAQ655, PAD660,
+    PAQ665, PAQ670, PAD675,
+    BMXBMI,
+    DR1TKCAL, DR2TKCAL,
+    SDMVSTRA, SDMVPSU
+  ) |> 
+  filter(RIDAGEYR >= 18)  
+```
+
+#old code keep incase
+```{r}
+# nhanes_2 <- files[order(!grepl("DEMO", files))]
+# 
+# 
+# nhanes_2 <- map(files, ~ read_xpt(.x) |> 
+#   select(any_of(c(
+#     
+#     "SEQN",    "RIAGENDR",  "RIDAGEYR",     # demographics
+#     "RIDRETH1", "DMDEDUC2", "INDFMPIR", 
+#     "DMDEDUC3",
+#     
+#     "CBD740", "CBD745",  # Exposure variables
+#     
+#     "BPXSY2", "BPXSY3", "BPXSY4",# Outcome BP variables
+#     "BPXDI2", "BPXDI3", "BPXDI4",
+#     # 'BPQ020',  # self-reported hypertension diagnosis
+#     # 'BPQ050A',  # self-reported hypertension medication use
+#     # 
+#     
+#   
+#     "ALQ120Q", "ALQ120U", "ALQ130",   # alcohol variables
+#     
+#     "SMQ020", "SMQ040",  # smoking variables
+#     
+#     "PAQ605", "PAQ610", "PAD615",   # physical activity variables
+#     "PAQ620", "PAQ625", "PAD630",
+#     "PAQ635", "PAQ640", "PAD645",
+#     "PAQ650", "PAQ655", "PAD660", 
+#     "PAQ665", "PAQ670", "PAD675", 
+#     
+#     "BMXBMI",    # BMI variable
+#     
+#     "WTMEC2YR", "SDMVSTRA", "SDMVPSU" # 2-year MEC exam weight + id + strata
+#     
+#   )))
+# )
+# 
+# nhanes_combined <- reduce(nhanes_final, left_join, by = "SEQN") |>
+#   filter(RIDAGEYR >= 18)
+```
+
+
+# Calculate HEI scores and  merge back to main dataset
+```{r}
+hei_0708 <- score(
+  method = "simple",
+  years = "0708",
+  component = "total score"
+)
+
+hei_0910 <- score(
+  method = "simple",
+  years = "0910",
+  component = "total score"
+) 
+
+hei_scores <- bind_rows(hei_0708, hei_0910) 
+ 
+
+nhanes_combined <- nhanes_combined %>%
+  left_join(
+    hei_scores %>%
+    select(SEQN, score, WTDR2D),
+    by = "SEQN"
+  ) |> 
+   mutate(WTDR4D = WTDR2D / 2)  # adjust for combining 2 cycles
+```
+
+# Transform/combine variables 
+```{r}
+#Coded values in the questionnaire such as 7, 9, 777 or 999, are recoded to NA
+
+nhanes_combined <- nhanes_combined |>
+  
+#Combine smoking variables into categorical, non-smoker-current
+  mutate(
+    
+  SMQ020 = na_if(SMQ020, 7),
+  SMQ020 = na_if(SMQ020, 9),
+  SMQ040 = na_if(SMQ040, 7),
+  
+ Smoking = factor(
+            case_when(
+  SMQ020 == 2 ~                       "Never",
+  SMQ020 == 1 & SMQ040 %in% c(1, 2) ~ "Current",
+  SMQ020 == 1 & SMQ040 == 3 ~         "Former"),
+ 
+  levels = c("Never", "Former", "Current")
+        )) |> 
+
+#Standardize all people into drinks per year, then 
+#combine alcohol variables into categorical
+   mutate(
+    ALQ120Q = na_if(ALQ120Q, 999),
+    ALQ130  = na_if(ALQ130, 999),
+    
+    Alc_year  = case_when(
+      ALQ120Q == 0 ~ 0,
+      ALQ120U == 1 ~ ALQ120Q * 52,   
+      ALQ120U == 2 ~ ALQ120Q * 12,   
+      ALQ120U == 3 ~ ALQ120Q * 1),
+
+  Drinks_year = Alc_year * coalesce(ALQ130, 0), 
+  Drinks_day  = Drinks_year / 365,   
+
+  Alcohol = factor(
+    case_when(
+    is.na(Drinks_day) ~ NA_character_,  # keep missing as NA
+    Drinks_day == 0 ~ "None",
+      RIAGENDR == 1 & Drinks_day >= 15/7 ~ "Heavy", 
+      RIAGENDR == 2 & Drinks_day >= 8/7  ~ "Heavy", 
+      RIAGENDR == 1 & Drinks_day <= 2 ~ "Moderate", 
+      RIAGENDR == 2 & Drinks_day <= 1 ~ "Moderate", 
+    TRUE ~ "Moderate"),
+
+    levels = c("None", "Moderate", "Heavy"))
+  ) |> 
+
+
+# Combine BP measurements  into binary hypertension variable 
+ mutate(
+  mean_sbp = rowMeans(cbind(BPXSY2, BPXSY3, BPXSY4), na.rm = TRUE),
+  mean_dbp = rowMeans(cbind(BPXDI2, BPXDI3, BPXDI4), na.rm = TRUE),
+  
+  
+  BPQ020 = if_else(BPQ020 %in% c(7, 9), NA_real_, BPQ020),
+  BPQ050A = if_else(BPQ050A %in% c(7, 9), NA_real_, BPQ050A),
+  
+    Hypertension = case_when(
+      mean_sbp >= 130 | 
+      mean_dbp >= 80  | 
+      BPQ020 == 1     | 
+      BPQ050A == 1    ~ "Yes",
+      TRUE            ~ "No"),
+      
+  Hypertension = factor(Hypertension, levels = c("No", "Yes"))) |> 
+  
+ mutate(
+  BP_Control = case_when(
+    mean_sbp >= 140 | 
+    mean_dbp >= 90  | 
+    BPQ020 == 1     | 
+    BPQ050A == 1    ~ "Yes",
+    TRUE ~ "No"
+  ),
+  BP_Control = factor(BP_Control, levels = c("No", "Yes"))
+) |>
+  
+  # mutate(
+  #   # 1. Create the Binary Variable
+  #   BP_Control = case_when(
+  #     # If they are NOT hypertensive, they aren't part of this "Control" math
+  #     Hypertension == "No" ~ NA_character_,
+  #     
+  #     # CONTROLLED: In the club AND numbers are < 130/80 (regardless of meds)
+  #     Hypertension == "Yes" & (mean_sbp < 130 & mean_dbp < 80) ~ "Controlled",
+  #     
+  #     # UNCONTROLLED: In the club AND numbers are >= 130 OR >= 80 (regardless of meds)
+  #     Hypertension == "Yes" & (mean_sbp >= 130 | mean_dbp >= 80) ~ "Uncontrolled",
+  #     
+  #     # Catch missing exam data
+  #     TRUE ~ NA_character_
+  #   ),
+  #   
+  #   # 2. Make it a factor for easy plotting/tables
+  #   BP_Control = factor(BP_Control, levels = c("Controlled", "Uncontrolled"))
+  # ) |>
+
+#combine all physical activity variables into total weekly minutes 
+  mutate(
+    # vigorous work
+    PAQ610 = na_if(PAQ610, 99),
+    PAD615 = na_if(PAD615, 9999),
+    PAQ610_c = if_else(PAQ605 == 2, 0, PAQ610),
+    PAD615_c = if_else(PAQ605 == 2, 0, PAD615),
+
+    # moderate work
+    PAQ620   = na_if(PAQ620, 9),
+    PAQ625   = na_if(PAQ625, 99),
+    PAD630   = na_if(PAD630, 9999),
+    PAQ625_c = if_else(PAQ620 == 2, 0, PAQ625),
+    PAD630_c = if_else(PAQ620 == 2, 0, PAD630),
+
+    # walk/bike
+    PAQ640   = na_if(PAQ640, 99),
+    PAD645   = na_if(PAD645, 9999),
+    PAQ640_c = if_else(PAQ635 == 2, 0, PAQ640),
+    PAD645_c = if_else(PAQ635 == 2, 0, PAD645),
+
+    # vigorous recreational
+    PAQ650   = na_if(PAQ650, 9),
+    PAD660   = na_if(PAD660, 9999),
+    PAQ655_c = if_else(PAQ650 == 2, 0, PAQ655),
+    PAD660_c = if_else(PAQ650 == 2, 0, PAD660),
+
+    # moderate recreational
+    PAQ670   = na_if(PAQ670, 9),
+    PAD675   = na_if(PAD675, 9999),
+    PAQ670_c = if_else(PAQ665 == 2, 0, PAQ670),
+    PAD675_c = if_else(PAQ665 == 2, 0, PAD675),
+
+    # minutes/week per domain
+    vig_work   = PAQ610_c * PAD615_c,
+    mod_work   = PAQ625_c * PAD630_c,
+    walk_bike  = PAQ640_c * PAD645_c,
+    vig_rec    = PAQ655_c * PAD660_c,
+    mod_rec    = PAQ670_c * PAD675_c,
+
+    # total in moderate-equivalent minutes
+    Total_pa_cont   = mod_work + mod_rec + walk_bike +
+                 2 * (vig_work + vig_rec),
+    
+    #create categorical variable for total PA
+    Total_pa =cut(Total_pa_cont, 
+                breaks = c(-Inf, 0, 149, 299, 599, Inf),
+                labels = c("0", "1–149", "150–299", "300–599", "600+"),
+                right = TRUE)) |>
+  
+ mutate(
+   avg_kcal = rowMeans(
+              across(c(DR1TKCAL, DR2TKCAL)),
+              na.rm = TRUE)
+   )
+```
+
+# Recode/Collapse Variables
+```{r}
+#This section only recode variables from numeric to factors/character and/or
+#collapse multiple categorical levels into fewer levels
+
+nhanes_combined <- nhanes_combined |>
+  rename(ID  = SEQN) |>
+  rename(Age = RIDAGEYR) |>
+  rename(Htn_diag = BPQ020) |>
+  rename(Meds = BPQ050A) |> 
+
+ mutate(
+
+   Gender = factor(
+            recode(RIAGENDR,
+                            `1` = "Male",
+                            `2` = "Female"),
+            levels = c("Male", "Female")),
+    
+ 
+    Race = fct_collapse(
+                as.factor(RIDRETH1),
+                              White    = "3",
+                              Black    = "4",
+                              Hispanic = c("1", "2"),
+                              Other    = "5")
+            |> fct_relevel("White"),
+   
+    # educ_combined = coalesce(          #combine both education varibles into 1
+    #   na_if(na_if(DMDEDUC2, 7), 9), DMDEDUC3),
+   
+    educ_combined = coalesce(
+  na_if(na_if(DMDEDUC2, 7), 9),
+  na_if(DMDEDUC3, 99)
+),
+   
+    Education = fct_collapse(
+      as.factor(educ_combined),
+               "Less than HS"     = c("1", "2", "9", "10", "11", "12", "66"),  
+               "High School/GED"  = c("3", "13", "14"),
+               "College or above" = c("4", "5", "15")),               
+      
+
+    RIncomePov = cut(INDFMPIR,
+                          breaks = c(-Inf, 1.00, 1.99, 3.99, Inf),
+                          labels = c("<1.00", "1.00–1.99", 
+                                     "2.00–3.99", ">4.00"),
+                          right = TRUE),
+  
+    Buy_org = factor(
+              recode(
+              na_if(na_if(CBD740, 3), 9),  
+                                `1` = "Yes",
+                                `2` = "No"),
+              levels = c("No", "Yes")),
+
+    
+    CBD745_c = if_else(CBD740 == 2, 5L,  # converts Buy_org No responses into 
+               na_if(CBD745, 9)),       #Never for Freq_buy_org
+            
+    
+    Freq_Buy_org = fct_collapse(
+                    as.factor(CBD745_c),   
+                              "Always/Most" = c("1", "2"),
+                               Sometimes    = "3",
+                               Rarely       = "4",
+                               Never        = "5")
+   |> fct_relevel("Never", "Rarely", "Sometimes", "Always/Most"),
+                            
+                          
+    BMI = cut(BMXBMI, 
+                        breaks = c(-Inf, 25, 30, Inf), 
+                        labels = c("Normal/Underweight",  
+                                   "Overweight", "Obese"), 
+                        right  = TRUE)
+       )
+```
+
+# Final selection of variables for analysis
+```{r}
+# Remove label so tbl_summary shows only "Age"
+for(col in c("Age", "ID")) {
+  attr(nhanes_combined[[col]], "label") <- NULL
+}
+
+#select final variables and relevant inclusion/exclusion criteria
+nhanes_final <- nhanes_combined |> 
+  select(
+    ID,
+    cycle,
+    Age,
+    Gender,
+    Race,
+    Education,
+    RIncomePov,
+    Smoking,
+    Alcohol,
+    Total_pa,
+    Buy_org,
+    Freq_Buy_org,
+    BMI,
+    Hypertension,
+    BP_Control,
+    avg_kcal,
+    score,
+    SDMVPSU,
+    SDMVSTRA,
+    WTDR4D)   |> 
+  drop_na(Buy_org,WTDR4D) 
+
+
+# save dataset
+write_xlsx(nhanes_final, 
+           "C:/Users/chris/OneDrive/Desktop/nhanes_final.xlsx")
+```
+
+
+#statistical Analysis
+# Check the data:
+```{r}
+nhanes_final  %>%  
+  { 
+    dup    <- any(duplicated(.))         # check for duplicates
+    na_c   <- colSums(is.na(.))          # check missing count
+    na_pct <- sort(colMeans(is.na(.)) * 100, decreasing = TRUE) |>
+              enframe(name = "variable", value = "%_missing")
+    list(duplicates = dup, NA_count = na_c, NA_percent = na_pct)
+  }
+```
+
+# Table 1: Basline Descriptive statistics
+```{r}
+#################### change n% for the new vars added to make sense
+##################################
+
+
+#Rename Variables for clarity in tables & figures 
+rename_var <- nhanes_final |>
+  rename(
+    'Age'                                = Age,
+    'Physical Activity'                  = Total_pa,
+    'Family Income to Poverty Ratio'     = RIncomePov,
+    'Body Mass Index'                    = BMI,
+    'Purchase Organic Food'              = Buy_org,
+    'Purchase Organic Food Frequency'    = Freq_Buy_org,
+    'Healthy Index Score'                = score,
+    'Total Daily Calories'               = avg_kcal,
+      )  
+
+tbl_0 <- rename_var |>
+  tbl_summary(
+    include = -c(
+      ID, cycle, WTDR4D, SDMVPSU, SDMVSTRA,
+      Hypertension, BP_Control,
+      'Purchase Organic Food',
+      'Purchase Organic Food Frequency'
+    ),
+    type = all_dichotomous() ~ "categorical",
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})"
+    ),
+    missing = "ifany",
+    missing_text = "Missing"
+  )
+    
+tbl_1 <- rename_var |>
+  tbl_summary(
+    by = 'Purchase Organic Food',
+    include = -c(
+      ID, cycle, WTDR4D, SDMVPSU, SDMVSTRA,
+      Hypertension, BP_Control,
+      'Purchase Organic Food Frequency'
+    ),
+    type = all_dichotomous() ~ "categorical",
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})"
+    ),
+    missing = "ifany",
+    missing_text = "Missing"
+  )
+
+# Combine 2 tables into one
+table_1 <- tbl_merge(
+  tbls = list(tbl_0, tbl_1),
+  tab_spanner = c("**Overall**", "**Organic Food Purchase**")
+) |>
+  modify_caption("Table 1. Baseline characteristics of participants in NHANES 2007–2008, according to their purchase of organic foods.") |>
+  modify_footnote_header(
+     footnote = "Physical activity numbers represent moderate-equivalent minutes per week.",
+    columns = all_stat_cols(),
+    replace = FALSE
+  ) |>
+  bold_labels()
+
+table_1 |>
+  as_gt() |>
+  gt::tab_options(
+    data_row.padding = px(2),          # reduces padding inside each row
+    table.font.size = "small",         # smaller font to make table more compact
+    table_body.hlines.width = 0,       # remove horizontal lines between rows
+    column_labels.border.bottom.width = 0, # remove column header line
+    table.border.top.width = 0,
+    table.border.bottom.width = 0,
+    heading.padding = px(2)            # reduces space at the top of the table
+  ) |>
+  gt::gtsave("table_1.html")
+  
+
+table_1 |>
+  as_flex_table() |>
+  flextable::save_as_docx(path = "table_1.docx")
+
+table_1
+```
+
+#check analyzable sample size
+```{r}
+#MAIN
+# org food and Hypertension
+sum(!is.na(nhanes_final$Buy_org) & !is.na(nhanes_final$Hypertension))
+
+# freq org food and Hypertension
+sum(!is.na(nhanes_final$Freq_Buy_org) & !is.na(nhanes_final$Hypertension))
+
+#SENSITIVITY
+#org food and control status
+sum(!is.na(nhanes_final$Buy_org) & !is.na(nhanes_final$BP_Control))
+
+# freq org food and control status
+sum(!is.na(nhanes_final$Freq_Buy_org) & !is.na(nhanes_final$BP_Control))
+
+
+```
+
+# Multiple Imputation 
+```{r}
+set.seed(123)
+
+# Define methods for imputation: "" = do not impute
+meth <- make.method(nhanes_final)
+meth["Education"]  <- "polyreg"
+meth["Smoking"]    <- "polyreg"
+meth["Alcohol"]    <- "polyreg"  # depends on how many categories
+meth["Total_pa"]   <- "polyreg"  # depends
+meth["RIncomePov"] <- "polyreg"
+meth["Freq_Buy_org"] <- "polyreg"
+meth["BMI"]          <- "polyreg"
+
+where <- make.where(nhanes_final)
+where[nhanes_final$cycle == "2009-2010", "Freq_Buy_org"] <- FALSE    
+
+mi <- mice::mice(nhanes_final, m = 10, method = meth, where = where, seed = 123)
+
+all_imputations <- imputationList(complete(mi, "all"))
+
+mi_data <- svydesign(
+  id = ~SDMVPSU,         
+  strata = ~SDMVSTRA,    
+  weights = ~WTDR4D,   
+  data = all_imputations,
+  nest = TRUE
+)
+```
+
+# Log model for organic food purchase (yes/no)
+```{r}
+#| warning: false
+
+# Run all models (unpooled)
+models <- list(
+  
+model_0 = with(mi_data, svyglm(
+  Hypertension ~ Buy_org, family = binomial())),
+
+model_1 = with(mi_data, svyglm(
+    Hypertension ~ Buy_org + Gender + Race + Age + Education + RIncomePov,
+  family = binomial())),
+
+model_2 = with(mi_data, svyglm(
+    Hypertension ~ Buy_org + Gender + Race + Age + Total_pa + Education + 
+    RIncomePov + Smoking + Alcohol + BMI + avg_kcal + score, 
+  family = binomial()))
+  )
+
+# Pool all models
+pooled <- lapply(models, MIcombine)
+```
+
+#Extract values needed to create odds table
+```{r}
+extract_1 <- function(micombine_obj, variable = "Buy_org") {
+
+  # extract coefficients & vcov
+  est <- micombine_obj$coefficients
+  se  <- sqrt(diag(micombine_obj$variance))
+
+  # find correct row (Buy_orgYes)
+  idx <- which(names(est) == variable)
+
+  # compute CI + OR
+  OR  <- exp(est[idx])
+  lower <- exp(est[idx] - 1.96 * se[idx])
+  upper <- exp(est[idx] + 1.96 * se[idx])
+  pval <- 2 * pnorm(abs(est[idx]/se[idx]), lower.tail = FALSE)
+
+  data.frame(
+    OR = OR,
+    CI = sprintf("%.2f–%.2f", lower, upper),
+    p = sprintf("%.3f", pval)
+  )
+}
+```
+
+#Log models for frequency of organic food purchase
+```{r}
+#| warning: false
+models_2 <- list(
+  
+  model_0.1 = with(mi_data, svyglm(
+    Hypertension ~ Freq_Buy_org, family = binomial())),
+
+  model_1.1 = with(mi_data, svyglm(
+    Hypertension ~ Freq_Buy_org + Gender + Race + Age + Education + RIncomePov,
+  family = binomial())),
+
+  model_2.1 = with(mi_data, svyglm(
+    Hypertension ~ Freq_Buy_org + Gender + Race + Age + Total_pa + 
+    Education + RIncomePov + Smoking + Alcohol + BMI + avg_kcal + score, 
+   family = binomial()))
+  )
+
+# Pool all models
+pooled2 <- lapply(models_2, MIcombine)
+```
+
+#Extract values needed to create odds table for frequency of organic food purchase
+```{r}
+extract_2 <- function(micombine_obj, variable = "Freq_Buy_org") {
+  est <- micombine_obj$coefficients
+  se  <- sqrt(diag(micombine_obj$variance))
+  nm  <- names(est)
+
+  idx <- grep(paste0("^", gsub("([\\W])", "\\\\\\1", variable)), nm)
+  if (!length(idx)) stop("No coefficients found for variable: ", variable)
+
+  OR    <- exp(est[idx])
+  lower <- exp(est[idx] - 1.96 * se[idx])
+  upper <- exp(est[idx] + 1.96 * se[idx])
+  pval  <- 2 * pnorm(abs(est[idx] / se[idx]), lower.tail = FALSE)
+
+  lvl <- sub(paste0("^", variable), "", nm[idx])
+  lvl <- sub("^[:= ]+", "", lvl)
+
+  data.frame(
+    Level = lvl,
+    OR = OR,
+    CI = sprintf("%.2f–%.2f", lower, upper),
+    p = sprintf("%.3f", pval),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+# Sensitivity Analysis 
+#sensitivity models for organic food purchase
+```{r}
+#| warning: false
+# Run all models (unpooled)
+models_3 <- list(
+  
+model_0.2 = with(mi_data, svyglm(
+  BP_Control ~ Buy_org, family = binomial())),
+
+model_1.2 = with(mi_data, svyglm(
+    BP_Control ~ Buy_org + Gender + Race + Age + Education + RIncomePov,
+  family = binomial())),
+
+model_2.2 = with(mi_data, svyglm(
+    BP_Control ~ Buy_org + Gender + Race + Age + Total_pa + Education + 
+    RIncomePov + Smoking + Alcohol + BMI + avg_kcal + score, 
+  family = binomial()))
+  )
+
+# Pool all models
+pooled3 <- lapply(models_3, MIcombine)
+```
+
+# sensitivity models for frequency of organic food purchase
+```{r}
+#| warning: false
+models_4 <- list(
+  
+  model_0.3 = with(mi_data, svyglm(
+    BP_Control ~ Freq_Buy_org, family = binomial())),
+
+  model_1.3 = with(mi_data, svyglm(
+    BP_Control ~ Freq_Buy_org + Gender + Race + Age + Education + RIncomePov,
+  family = binomial())),
+
+  model_2.3 = with(mi_data, svyglm(
+    BP_Control ~ Freq_Buy_org + Gender + Race + Age + Total_pa + 
+    Education + RIncomePov + Smoking + Alcohol + BMI + avg_kcal + score, 
+   family = binomial()))
+  )
+
+# Pool all model
+pooled4 <- lapply(models_4, MIcombine)
+```
+
+#Tables and Figures
+# Table 2: organic food and hypertension
+```{r}
+table_2 <- bind_rows(
+  extract_1(pooled$model_0, "Buy_orgYes") |> mutate(Model = "Crude"),
+  extract_1(pooled$model_1, "Buy_orgYes") |> mutate(Model = "Model 1"),
+  extract_1(pooled$model_2, "Buy_orgYes") |> mutate(Model = "Model 2")
+) |>
+  
+select(Model, OR, CI, p) |>
+mutate(Model = factor(Model, levels = c("Crude", "Model 1", "Model 2"))) |>
+  
+gt(rowname_col = "Model") |>   # <-- make Model the stub
+tab_header(
+  title = md("**Table 2. Association between organic food purchase and 
+             hypertension, NHANES 2007–2010.**")
+) |>
+cols_label(
+  OR = "Odds Ratio (OR)",
+  CI = "95% (CI)",
+  p  = "P-value"
+) |>
+fmt_number(
+  columns = vars(OR),
+  decimals = 2
+) |>
+cols_align(
+  align = "center",
+  columns = everything()
+) |>
+  
+tab_footnote(
+  footnote = paste(
+    "Model 1: adjusted for gender, race, age, education, and ratio of family 
+    income to poverty."),
+  locations = cells_stub(rows = "Model 1")
+) |>
+tab_footnote(
+  footnote = paste(
+    "Model 2: adjusted for model 1 plus total physical activity, smoking, 
+    alcohol, and BMI."),
+  locations = cells_stub(rows = "Model 2")
+)
+
+table_2 <- table_2 |> 
+  tab_options(
+    table.border.top.width = 0,
+    table.border.bottom.width = 0,
+    column_labels.border.bottom.width = 0,
+    table_body.hlines.width = 0,   # remove horizontal lines between rows
+    table_body.vlines.width = 0,   # remove vertical lines
+    table.font.size = "small",     # optional, smaller font
+    heading.padding = px(2),
+    data_row.padding = px(2)
+  ) 
+ 
+
+
+table_2
+```
+
+# Table 3: Frequency organic food and hypertension
+```{r}
+ref_row <- tibble(
+  Level = "Never",
+  OR    = 1,
+  CI    = "Reference",
+  p     = "—"  
+)
+
+table_3 <- bind_rows(
+  bind_rows(ref_row, extract_2(pooled2$model_0.1, "Freq_Buy_org")) |> 
+    mutate(Model = "Crude"),
+  bind_rows(ref_row, extract_2(pooled2$model_1.1, "Freq_Buy_org")) |> 
+    mutate(Model = "Model 1"),
+  bind_rows(ref_row, extract_2(pooled2$model_2.1, "Freq_Buy_org")) |> 
+    mutate(Model = "Model 2")
+) |>
+  
+select(Model, Level, OR, CI, p) |>
+  
+mutate(Model = factor(Model, levels = c("Crude", "Model 1", "Model 2"))) |>
+  
+gt(groupname_col = "Model", rowname_col = "Level") |>
+tab_header(
+  title = md("**Table 3. Association between frequency of organic food purchase 
+              and hypertension, NHANES 2007–2010. **")
+) |>
+cols_label(
+  OR = "Odds Ratio (OR)",
+  CI = "95% CI",
+  p  = "P-value"
+) |>
+fmt_number(
+  columns = OR,
+  decimals = 2
+) |>
+cols_align(
+  align = "center",   
+  columns = everything()
+) |>
+tab_footnote(
+  footnote = "Model 1: adjusted for gender, race, age, education, and ratio 
+              of family income to poverty.",
+  locations = cells_row_groups(groups = "Model 1")
+) |>
+tab_footnote(
+  footnote = "Model 2: adjusted for model 1 plus total physical activity, 
+              smoking, alcohol, and BMI.",
+  locations = cells_row_groups(groups = "Model 2")
+) |> 
+  
+  tab_options(
+    table.border.top.width = 0,
+    table.border.bottom.width = 0,
+    column_labels.border.bottom.width = 0,
+    table_body.hlines.width = 0,      # remove horizontal lines
+    table_body.vlines.width = 0,      # remove vertical lines
+    row_group.border.bottom.width = 0,
+    data_row.padding = px(2),         # smaller padding for rows
+    heading.padding = px(2)           # smaller padding for title/captions
+  )
+
+table_3
+```
+
+
+# Table 4: senstivty organic food and hypertension
+```{r}
+table_4 <- bind_rows(
+  extract_1(pooled3$model_0.2, "Buy_orgYes")   |>  mutate(Model = "Crude"),
+  extract_1(pooled3$model_1.2, "Buy_orgYes")   |>  mutate(Model = "Model 1"),
+  extract_1(pooled3$model_2.2, "Buy_orgYes")   |>  mutate(Model = "Model 2")) |>
+  
+mutate(
+    No = "1.00 (reference)",
+    Yes  = paste0(OR |> round(2), " (", CI, ")")) |>
+  select(Model, No, Yes, p) |> 
+
+gt(rowname_col = "Model") |>   
+  tab_header(
+    title = md("**Table S1. Association between organic food purchase and 
+    hypertension (≥ 140/90 mmHg), NHANES 2007–2010.**")) |>
+cols_label(
+    No = "No",
+    Yes   = "Yes",
+    p   = "P-value") |>
+  cols_align("center", everything()) |> 
+
+tab_footnote(
+    footnote = "Odds ratio (95% confidence intervals).",
+    locations = cells_column_labels(columns = Yes)
+  ) |> 
+  
+tab_footnote(
+  footnote = paste(
+    "Model 1: adjusted for gender, race, age, education, and ratio of family",
+    "income to poverty."),
+  locations = cells_stub(rows = "Model 1")
+) |>
+
+tab_footnote(
+  footnote = paste(
+    "Model 2: adjusted for model 1 plus total physical activity, smoking,",
+    "alcohol, and BMI."),
+  locations = cells_stub(rows = "Model 2"))
+
+table_4
+
+```
+
+# Table 5: senstivity frequency organic food and hypertension
+```{r}
+ref_row <- tibble(
+  Level = "Never",
+  OR    = 1,
+  CI    = "Reference",
+  p     = "—"   # em dash, solid line
+)
+
+table_5 <- bind_rows(
+  bind_rows(ref_row, extract_2(pooled4$model_0.3, "Freq_Buy_org")) |> 
+    mutate(Model = "Crude"),
+  bind_rows(ref_row, extract_2(pooled4$model_1.3, "Freq_Buy_org")) |> 
+    mutate(Model = "Model 1"),
+  bind_rows(ref_row, extract_2(pooled4$model_2.3, "Freq_Buy_org")) |> 
+    mutate(Model = "Model 2")
+) |>
+  
+select(Model, Level, OR, CI, p) |>
+  
+mutate(Model = factor(Model, levels = c("Crude", "Model 1", "Model 2"))) |>
+  
+gt(groupname_col = "Model", rowname_col = "Level") |>
+tab_header(
+  title = md("**Association between frequency of organic food purchase and 
+  hypertension (≥ 140/90 mmHg), NHANES 2007–2010. **")
+) |>
+cols_label(
+  OR = "Odds Ratio (OR)",
+  CI = "95% CI",
+  p  = "P-value"
+) |>
+fmt_number(
+  columns = OR,
+  decimals = 2
+) |>
+cols_align(
+  align = "center",   
+  columns = everything()
+) |>
+tab_footnote(
+  footnote = "Model 1: adjusted for gender, race, age, education, and ratio 
+              of family income to poverty.",
+  locations = cells_row_groups(groups = "Model 1")
+) |>
+tab_footnote(
+  footnote = "Model 2: adjusted for model 1 plus total physical activity, 
+              smoking, alcohol, and BMI.",
+  locations = cells_row_groups(groups = "Model 2")
+) |> 
+  
+   tab_options(
+    table.border.top.width = 0,
+    table.border.bottom.width = 0,
+    column_labels.border.bottom.width = 0,
+    table_body.hlines.width = 0,      # remove horizontal lines
+    table_body.vlines.width = 0,      # remove vertical lines
+    row_group.border.bottom.width = 0,
+    data_row.padding = px(2),         # smaller padding for rows
+    heading.padding = px(2)           # smaller padding for title/captions
+  )
+
+table_5
+```
+
+
+
+
+
